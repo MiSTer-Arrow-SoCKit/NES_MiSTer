@@ -21,21 +21,26 @@ module MapperFDS(
 	inout        irq_b,       // IRQ
 	input [15:0] audio_in,    // Inverted audio from APU
 	inout [15:0] audio_b,     // Mixed audio output
-	inout [15:0] flags_out_b, // flags {0, 0, 0, 0, 0, prg_conflict, prg_open_bus, has_chr_dout}
+	inout [15:0] flags_out_b, // flags {0, 0, 0, 0, 0, prg_conflict, prg_bus_write, has_chr_dout}
 	// Special ports
-	input        fds_swap     // User input to change disks
+	input [7:0] audio_dout,
+	inout [1:0] diskside_auto_b,
+	input [1:0] diskside,
+	input       fds_busy,
+	input       fds_eject
 );
 
-assign prg_aout_b   = enable ? prg_aout : 22'hZ;
-assign prg_dout_b   = enable ? prg_dout : 8'hZ;
-assign prg_allow_b  = enable ? prg_allow : 1'hZ;
-assign chr_aout_b   = enable ? chr_aout : 22'hZ;
-assign chr_allow_b  = enable ? chr_allow : 1'hZ;
-assign vram_a10_b   = enable ? vram_a10 : 1'hZ;
-assign vram_ce_b    = enable ? vram_ce : 1'hZ;
-assign irq_b        = enable ? irq : 1'hZ;
-assign flags_out_b  = enable ? flags_out : 16'hZ;
-assign audio_b      = enable ? 16'hFFFF - audio[16:1] : 16'hZ;
+assign prg_aout_b      = enable ? prg_aout : 22'hZ;
+assign prg_dout_b      = enable ? prg_dout : 8'hZ;
+assign prg_allow_b     = enable ? prg_allow : 1'hZ;
+assign chr_aout_b      = enable ? chr_aout : 22'hZ;
+assign chr_allow_b     = enable ? chr_allow : 1'hZ;
+assign vram_a10_b      = enable ? vram_a10 : 1'hZ;
+assign vram_ce_b       = enable ? vram_ce : 1'hZ;
+assign irq_b           = enable ? irq : 1'hZ;
+assign flags_out_b     = enable ? flags_out : 16'hZ;
+assign audio_b         = enable ? audio[15:0] : 16'hZ;
+assign diskside_auto_b = enable ? diskside_auto : 2'hZ;
 
 wire [21:0] prg_aout, chr_aout;
 wire prg_allow;
@@ -43,8 +48,11 @@ wire chr_allow;
 wire vram_a10;
 wire vram_ce;
 wire [7:0] prg_dout;
-reg [15:0] flags_out = 0;
+wire [15:0] flags_out = {14'd0, prg_bus_write, 1'b0};
+wire prg_bus_write;
 wire irq;
+wire [1:0] diskside_auto;
+wire [15:0] audio = audio_in;
 
 wire nesprg_oe;
 wire [7:0] neschrdout;
@@ -64,31 +72,17 @@ always @(posedge clk) begin
 end
 
 MAPFDS fds(m2[7], m2_n, clk, ~enable, prg_write, nesprg_oe, 0,
-	1, prg_ain, chr_ain, prg_din, 8'b0, prg_dout,
+	1, prg_ain, chr_ain, prg_din, 8'b0, prg_dout, prg_bus_write,
 	neschrdout, neschr_oe, chr_allow, chrram_oe, wram_oe, wram_we, prgram_we,
 	prgram_oe, chr_aout[18:10], prg_aout[18:0], irq, vram_ce, exp6,
 	0, 7'b1111111, 6'b111111, flags[14], flags[16], flags[15],
-	ce, fds_swap, prg_allow, audio_exp);
+	ce, prg_allow, audio_dout, diskside_auto, diskside, fds_busy, fds_eject);
 
 assign chr_aout[21:19] = 3'b100;
 assign chr_aout[9:0] = chr_ain[9:0];
 assign vram_a10 = chr_aout[10];
-assign prg_aout[21:19] = 3'b000;
+assign prg_aout[21:19] = prg_aout[18] ? 3'b111 : 3'b000;  //Switch to Cart Ram for Disk access
 //assign prg_aout[12:0] = prg_ain[12:0];
-
-wire [11:0] audio_exp;
-
-// XXX: This needs to be replaced with a proper ~2000hz LPF
-lpf_aud fds_lpf
-(
-	.CLK(clk),
-	.CE(ce),
-	.IDATA(16'hFFFF - {1'b0, audio_exp[11:0], audio_exp[11:9]}),
-	.ODATA(audio_exp_f)
-);
-
-wire [15:0] audio_exp_f;
-wire [16:0] audio = audio_in + audio_exp_f;
 
 endmodule
 
@@ -111,6 +105,7 @@ module MAPFDS(              //signal descriptions in powerpak.v
 	input [7:0] nesprgdin,
 	input [7:0] ramprgdin,
 	output reg [7:0] nesprgdout,
+	output prg_bus_write,
 
 	output [7:0] neschrdout,
 	output neschr_oe,
@@ -135,10 +130,13 @@ module MAPFDS(              //signal descriptions in powerpak.v
 	input cfg_chrram,
 
 	input ce,// add
-	input fds_swap,
 	output prg_allow,
-	output [11:0] snd_level,
-	input [1:0] diskside_manual
+	input [7:0] audio_dout,
+	//output [11:0] snd_level,
+	output reg [1:0] diskside_auto,
+	input [1:0] diskside,
+	input fds_busy,
+	input fds_eject
 );
 
 	localparam WRITE_LO=16'hF4CD, WRITE_HI=16'hF4CE, READ_LO=16'hF4D0, READ_HI=16'hF4D1;
@@ -151,7 +149,6 @@ module MAPFDS(              //signal descriptions in powerpak.v
 	reg timer_irq;
 	reg [1:0] Wstate;
 	reg [1:0] Rstate;
-	wire [7:0] audio_dout;
 
 	assign chrram_we=!chrain[13] & neschr_wr;
 	assign chrram_oe=!chrain[13] & neschr_rd;
@@ -170,16 +167,20 @@ module MAPFDS(              //signal descriptions in powerpak.v
 	reg [17:0] sideoffset;
 	wire [17:0] romoffset;
 
+	assign prg_bus_write = (fds_prg_bus_write | fds_audio_prg_bus_write);
+	reg fds_prg_bus_write;
+	wire fds_audio_prg_bus_write = (prgain >= 16'h4040 && prgain < 16'h4080) | (prgain >= 16'h4090 && prgain <= 16'h4097);
+
 // Loopy's patched bios use a trick to catch requested diskside for games
 // using standard bios load process.
 // Unlicensed games sometimes doesn't use standard bios load process. This
 // break automatic diskside trick.
 // diskside_manual to be manage from OSD user input allow to add diskswap capabilities.
-// (automatic fds_swap should be preferably stopped before changing diskside_manual)
+// (automatic fds_eject should be preferably stopped before changing diskside_manual)
 
-	reg [1:0] diskside_auto;
-	wire[1:0] diskside;
-	assign diskside = diskside_auto + diskside_manual;
+//	reg [1:0] diskside_auto;
+//	wire[1:0] diskside;
+//	assign diskside = diskside_auto + diskside_manual;
 	wire diskend=(diskpos==65499);
 	always@* case(diskside) //16+65500*diskside
 		0:sideoffset=18'h00010;
@@ -198,7 +199,8 @@ module MAPFDS(              //signal descriptions in powerpak.v
 // Here proposed solution is to create an infinite loop at the end of normal
 // load subroutine if @$2000 was written during load subroutine. Infinite loop
 // give enough time for NMI to occure. (Generaly observed NMI enabling file is
-// the last file of 'normal' loading process to be loaded).
+// the last file of 'normal' loading process to be loaded). @2000.7 is checked to
+// ensure the NMI is being turned on ($90 or $80 mentioned above).
 
 	// manage infinite loop trap at the end ($E233) of LoadFiles subroutine
 //	 reg previous_is_E1F9;
@@ -219,8 +221,8 @@ always@(posedge clk20)
 					// deactivate infinite loop at LoadFile subroutine
 					if(prgain==16'hE1FA) infinite_loop_on_E233 <= 0;
 
-					// activate infinite loop if @$2000 is accessed during FileLoad subroutine
-					if((prgain==16'h2000) && (within_loader == 1)) infinite_loop_on_E233 <= 1;
+					// activate infinite loop if @$2000 is written with NMI (bit 7) high during FileLoad subroutine
+					if((prgain==16'h2000) && (within_loader == 1) && (nesprgdin[7])) infinite_loop_on_E233 <= 1;
 				end
 
 		end
@@ -236,7 +238,9 @@ wire match6=prgain[15:8]==8'h40 && |prgain[7:6];    //4040..40FF
 wire match7=(prgain==16'hE233) & infinite_loop_on_E233 & (ramprgaout[18]==1'b0);
 wire match8=(prgain==16'hE234) & infinite_loop_on_E233 & (ramprgaout[18]==1'b0);
 wire match9=(prgain==16'hE235) & infinite_loop_on_E233 & (ramprgaout[18]==1'b0);
-always@*
+wire match10=prgain==16'h4029;      //MiSTer Busy
+always @* begin
+	fds_prg_bus_write = 1'b1;
 	case(1)
 		match0: nesprgdout={7'd0, timer_irq};
 		match1: nesprgdout={5'd0, disk_eject, diskend, disk_eject};
@@ -248,8 +252,14 @@ always@*
 		match7: nesprgdout=8'h4C;  // when infinite loop is active replace jsr $E778 with jmp $E233
 		match8: nesprgdout=8'h33;
 		match9: nesprgdout=8'hE2;
-		default: nesprgdout=ramprgdin;
+		match10:nesprgdout={7'd0,~fds_busy};//MiSTer busy (zero = busy)
+		default: begin
+			nesprgdout=ramprgdin;
+			fds_prg_bus_write = 0;
+		end
 	endcase
+end
+
 assign prg_allow = (nesprg_we & (Wstate==2 | (prgain[15]^(&prgain[14:13]))))
 				| (~nesprg_we & ((prgain[15] & !match3 & !match4 & !match7 & !match8 & !match9) | prgain[15:13]==3));
 
@@ -262,6 +272,10 @@ assign prg_allow = (nesprg_we & (Wstate==2 | (prgain[15]^(&prgain[14:13]))))
 	reg [15:0] timerlatch;
 	reg [15:0] timer;
 	always@(posedge clk20) begin
+		if(reset) begin
+			diskside_auto <= 2'd0;
+		end
+
 		if (ce) begin
 			if (timer_irq_en) begin
 				if (timer == 0) begin
@@ -354,21 +368,22 @@ end
 assign irq=timer_irq; // | disk_irq
 
 //disk eject:   toggle flag continuously except when select button is held
-reg [2:0] control_cnt;
-reg [21:0] clkcount;
+//reg [2:0] control_cnt; //use fds_eject instead
+//reg [21:0] clkcount;
 
-assign disk_eject=clkcount[21] | fds_swap;
+//assign disk_eject=clkcount[21] | fds_eject;
+assign disk_eject=fds_eject;
 
-always@(posedge clk20) begin
-	if (ce) begin
-		clkcount<=clkcount+1'd1;
-		if(prgain==16'h4016) begin
-			if(nesprg_we)                           control_cnt<=0;
-			else if(~nesprg_we & control_cnt!=7)    control_cnt<=control_cnt+1'd1;
-			//if(~nesprg_we & control_cnt==2)          button<=|nesprgdin[1:0];
-		end
-	end
-end
+//always@(posedge clk20) begin
+//	if (ce) begin
+//		clkcount<=clkcount+1'd1;
+//		if(prgain==16'h4016) begin
+//			if(nesprg_we)                           control_cnt<=0;
+//			else if(~nesprg_we & control_cnt!=7)    control_cnt<=control_cnt+1'd1;
+//			//if(~nesprg_we & control_cnt==2)          button<=|nesprgdin[1:0];
+//		end
+//	end
+//end
 
 //bankswitch control: 6000-DFFF = sram, E000-FFFF = bios or disk
 reg [18:13] prgbank;
@@ -388,18 +403,47 @@ assign ramchraout[18:11]={6'd0,chrain[12:11]};
 assign ramchraout[10]=!chrain[13]? chrain[10]: ((vertical & chrain[10]) | (!vertical & chrain[11]));
 assign ciram_ce=chrain[13];
 
+endmodule
+
+module fds_mixed (
+	input         clk,
+	input         ce,    // Negedge M2 (aka CPU ce)
+	input         enable,
+	input         wren,
+	input  [15:0] addr_in,
+	input   [7:0] data_in,
+	output  [7:0] data_out,
+	input  [15:0] audio_in,    // Inverted audio from APU
+	output [15:0] audio_out
+);
+
 //expansion audio
 fds_audio fds_audio
 (
-	.clk(clk20),
+	.clk(clk),
 	.m2(ce),
-	.reset(reset),
-	.wr(nesprg_we),
-	.addr_in(prgain),
-	.data_in(nesprgdin),
-	.data_out(audio_dout),
-	.audio_out(snd_level)
+	.reset(!enable),
+	.wr(wren),
+	.addr_in(addr_in),
+	.data_in(data_in),
+	.data_out(data_out),
+	.audio_out(audio_exp)
 );
+
+wire [11:0] audio_exp;
+
+// XXX: This needs to be replaced with a proper ~2000hz LPF
+lpf_aud fds_lpf
+(
+	.CLK(clk),
+	.CE(ce),
+	.IDATA(16'hFFFF - {1'b0, audio_exp[11:0], audio_exp[11:9]}),
+	.ODATA(audio_exp_f)
+);
+
+wire [15:0] audio_exp_f;
+wire [16:0] audio = audio_in + audio_exp_f;
+assign audio_out = 16'hFFFF - audio[16:1];
 
 endmodule
 

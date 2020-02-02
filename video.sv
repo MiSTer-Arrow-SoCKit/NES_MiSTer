@@ -4,6 +4,8 @@
 module video
 (
 	input        clk,
+	input        reset,
+	input  [1:0] cnt,
 	input  [5:0] color,
 	input  [8:0] count_h,
 	input  [8:0] count_v,
@@ -12,8 +14,17 @@ module video
 	input        hide_overscan,
 	input  [3:0] palette,
 	input  [2:0] emphasis,
+	input  [1:0] reticle,
+	input        pal_video,
+
+	input        load_color,
+	input [14:0] load_color_data,
+	input  [5:0] load_color_index,
+
+	inout [21:0] gamma_bus,
 
 	output       ce_pix,
+	output   reg hold_reset,
 
 	output       VGA_HS,
 	output       VGA_VS,
@@ -24,11 +35,9 @@ module video
 );
 
 reg pix_ce, pix_ce_n;
+wire [5:0] color_ef = reticle[0] ? (reticle[1] ? 6'h21 : 6'h15) : is_padding ? 6'd63 : color;
 
 always @(negedge clk) begin
-	reg [1:0] cnt = 0;
-
-	cnt <= cnt + 1'd1;
 	pix_ce   <= ~cnt[1] & ~cnt[0];
 	pix_ce_n <=  cnt[1] & ~cnt[0];
 end
@@ -202,6 +211,17 @@ wire [15:0] pal_nintendulator_lut[64] = '{
 	'h439C, 'h43D9, 'h53F6, 'h67F5, 'h7BB5, 'h5AD6, 'h0000, 'h0000
 };
 
+wire [14:0] mem_data;
+
+spram #(.addr_width(6), .data_width(15), .mem_name("pal"), .mem_init_file("tao.mif")) pal_ram
+(
+	.clock(clk),
+	.address(load_color ? load_color_index : color_ef),
+	.data(load_color_data),
+	.wren(load_color),
+	.q(mem_data)
+);
+
 reg [14:0] pixel;
 reg HBlank_r, VBlank_r;
 
@@ -209,21 +229,22 @@ always @(posedge clk) begin
 	
 	if(pix_ce_n) begin
 		case (palette)
-			0: pixel <= pal_smooth_lut[color][14:0];
-			1: pixel <= pal_unsat_lut[color][14:0];
-			2: pixel <= pal_fcelut[color][14:0];
-			3: pixel <= pal_nes_classic_lut[color][14:0];
-			4: pixel <= pal_composite_direct_lut[color][14:0];
-			5: pixel <= pal_pc10_lut[color][14:0];
-			6: pixel <= pal_pvm_lut[color][14:0];
-			7: pixel <= pal_wavebeam_lut[color][14:0];
-			8: pixel <= pal_real_lut[color][14:0];
-			9: pixel <= pal_sonycxa_lut[color][14:0];
-			10: pixel <= pal_yuv_lut[color][14:0];
-			11: pixel <= pal_greyscale_lut[color][14:0];
-			12: pixel <= pal_rockman9_lut[color][14:0];
-			13: pixel <= pal_nintendulator_lut[color][14:0];
-			default:pixel <= pal_smooth_lut[color][14:0];
+			0: pixel <= pal_smooth_lut[color_ef][14:0];
+			1: pixel <= pal_unsat_lut[color_ef][14:0];
+			2: pixel <= pal_fcelut[color_ef][14:0];
+			3: pixel <= pal_nes_classic_lut[color_ef][14:0];
+			4: pixel <= pal_composite_direct_lut[color_ef][14:0];
+			5: pixel <= pal_pc10_lut[color_ef][14:0];
+			6: pixel <= pal_pvm_lut[color_ef][14:0];
+			7: pixel <= pal_wavebeam_lut[color_ef][14:0];
+			8: pixel <= pal_real_lut[color_ef][14:0];
+			9: pixel <= pal_sonycxa_lut[color_ef][14:0];
+			10: pixel <= pal_yuv_lut[color_ef][14:0];
+			11: pixel <= pal_greyscale_lut[color_ef][14:0];
+			12: pixel <= pal_rockman9_lut[color_ef][14:0];
+			13: pixel <= pal_nintendulator_lut[color_ef][14:0];
+			14: pixel <= mem_data;
+			default:pixel <= pal_smooth_lut[color_ef][14:0];
 		endcase
 	
 		HBlank_r <= HBlank;
@@ -235,11 +256,16 @@ end
 reg  HBlank, VBlank, HSync, VSync;
 reg  [9:0] h, v;
 reg  [1:0] free_sync = 0;
-wire [9:0] hc = (&free_sync) ? h : count_h;
-wire [9:0] vc = (&free_sync) ? v : count_v;
+wire [9:0] hc = (&free_sync | reset) ? h : count_h;
+wire [9:0] vc = (&free_sync | reset) ? v : count_v;
+wire [9:0] vsync_start = (pal_video ? 10'd270 : 10'd243);
 
 always @(posedge clk) begin
 	reg [8:0] old_count_v;
+	if (h == 0 && v == 0)
+		hold_reset <= 1'b0;
+	else if (reset)
+		hold_reset <= 1'b1;
 
 	if(pix_ce_n) begin
 		if((old_count_v == 511) && (count_v == 0)) begin
@@ -249,7 +275,7 @@ always @(posedge clk) begin
 		end else begin
 			if(h == 340) begin
 				h <= 0;
-				if(v == 261) begin
+				if(v == (pal_video ? 311 : 261)) begin
 					v <= 0;
 					if(~&free_sync) free_sync <= free_sync + 1'd1;
 				end else begin
@@ -263,44 +289,64 @@ always @(posedge clk) begin
 		old_count_v <= count_v;
 	end
 
+	// The NES and SNES proper resolutions are 280 pixels wide, and 240 lines high. Only 256 of these pixels per line
+	// are drawn with image data, but the real PPU padded the rest with color 0 to make the aspect ratio correct, since
+	// they anticipated the overscan. This padding MUST be considered when scaling the image to 4:3 AR.
+	// http://wiki.nesdev.com/w/index.php?title=Overscan#For_emulator_developers
+
+	// Overscan is simply a zoom-in, and most emulators will take off 8 from the top and bottom to reach the magic
+	// number of 224 pixels, so we take off a proportional percentage from the sides to compensate.
+
 	if(pix_ce) begin
 		if(hide_overscan) begin
-			HBlank <= (hc > (256-8)) || (hc<7);
-			VBlank <= (vc > (240-10)) || (vc<7);
+			HBlank <= (hc >= HBL_START && hc <= HBL_END);                  // 280 - ((224/240) * 16) = 261.3
+			VBlank <= (vc > (VBL_START - 9)) || (vc < 8);                  // 240 - 16 = 224
 		end else begin
-			HBlank <= (hc >= 256);
-			VBlank <= (vc >= 240);
+			HBlank <= (hc >= HBL_START) && (hc <= HBL_END);                // 280 pixels
+			VBlank <= (vc >= VBL_START);                                   // 240 lines
 		end
-		HSync  <= ((hc >= 277) && (hc < 302));
-		VSync  <= ((vc >= 242) && (vc < 245));
+		
+		if(hc == 278) begin
+			HSync <= 1;
+			VSync <= ((vc >= vsync_start) && (vc < vsync_start+3));
+		end
+
+		if(hc == 303) HSync <= 0;
 	end
 end
 
-wire dark_r, dark_g, dark_b;
-// bits are in order {B, G, R} color emphasis
-always_comb begin
-	{dark_r, dark_g, dark_b} = 3'b000;
+localparam HBL_START = 256;
+localparam HBL_END   = 340;
+localparam VBL_START = 240;
+localparam VBL_END   = 511;
 
-	if (~&color[3:0] & |emphasis) begin
+wire is_padding = (hc > 255);
+
+reg dark_r, dark_g, dark_b;
+// bits are in order {B, G, R} for NTSC color emphasis
+// Only effects range $00-$0D, $10-$1D, $20-$2D, and $30-$3D
+always @(posedge clk) if (pix_ce_n) begin
+	{dark_r, dark_g, dark_b} <= 3'b000;
+
+	if ((color_ef[3:0] < 4'hE) && |emphasis) begin
 		if (~&emphasis) begin
-			dark_r = ~emphasis[2];
-			dark_g = ~emphasis[1];
-			dark_b = ~emphasis[0];
+			dark_r <= ~emphasis[0];
+			dark_g <= ~emphasis[1];
+			dark_b <= ~emphasis[2];
 		end else begin
-			{dark_r, dark_g, dark_b} = 3'b111;
+			{dark_r, dark_g, dark_b} <= 3'b111;
 		end
 	end
-
 end
 
 wire  [4:0] vga_r = dark_r ? pixel[4:1] + pixel[4:2] : pixel[4:0];
 wire  [4:0] vga_g = dark_g ? pixel[9:6] + pixel[9:7] : pixel[9:5];
 wire  [4:0] vga_b = dark_b ? pixel[14:11] + pixel[14:12] : pixel[14:10];
 
-video_mixer #(260, 0) video_mixer
+video_mixer #(260, 0, 1) video_mixer
 (
 	.*,
-	.clk_sys(clk),
+	.clk_vid(clk),
 	.ce_pix(pix_ce),
 	.ce_pix_out(ce_pix),
 	
