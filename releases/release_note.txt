@@ -1,0 +1,2 @@
+In order to get NES Core running on Arrow SoCKit FPGA, you have to install MiSTer SDRAM Expansion board to the HSMC adapter's GPIO J3 port. In J2 port it would operate slower, that is why it was important to put as close as possible.
+In HSMC adapter the GPIO J4 port cannot be used, so for NES Core please use the GPIO J3 port.
